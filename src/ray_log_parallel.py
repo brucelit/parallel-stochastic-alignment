@@ -49,7 +49,7 @@ class Parameters(Enum):
 PARAM_TRACE_COST_FUNCTION = Parameters.PARAM_TRACE_COST_FUNCTION.value
 PARAM_MODEL_COST_FUNCTION = Parameters.PARAM_MODEL_COST_FUNCTION.value
 PARAM_SYNC_COST_FUNCTION = Parameters.PARAM_SYNC_COST_FUNCTION.value
-PARAM_COST_TOLERANCE = 2
+PARAM_COST_TOLERANCE = 4
 # Initialize Ray with the number of CPU cores
 
 
@@ -485,10 +485,10 @@ def compute_alignment(trace, model_path):
 
 
 start_time = time.time()
-ray.init(num_cpus=8)
+ray.init(num_cpus=4)
 
 # Import the event log and the Petri net model
-log = xes_importer.apply("../log/prAm6_variants.xes")
+log = xes_importer.apply("../log/prAm6_variants_100.xes")
 
 model_path = '../model/prAm6.pnml'
 

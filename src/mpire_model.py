@@ -22,10 +22,12 @@ from src.decompose_petri import decompose_into_k_subnet
 from src.search_heuristic import trust_solution, compute_exact_heuristic_new_version, derive_heuristic
 from src.search_marking import SearchMarking
 from src.search_sync_net import copy_into, is_log_move, is_model_move
+from mpire import WorkerPool
 
 # Set the logging level to WARNING to suppress informational messages
 logging.getLogger('pm4py').setLevel(logging.WARNING)
 
+PARAM_CPU_NUM_LST = [1, 2, 3, 4, 5, 6, 7, 8]
 PARAM_COST_TOLERANCE = [2000]
 SKIP = '>>'
 STD_MODEL_LOG_MOVE_COST = 1000
@@ -34,6 +36,7 @@ STD_SYNC_COST = 0
 
 
 def compute_alignments(trace_idx: int,
+                       optimal_alignment_lst,
                        cost_tolerance: int,
                        trace: Trace,
                        petri_net: PetriNet,
@@ -56,9 +59,6 @@ def compute_alignments(trace_idx: int,
 
     # determine whether the final marking is reached for the first time
     reach_fm = False
-
-    # get the optimal cost
-    optimal_alignment_cost = 1000000
 
     # ---- initialize ------
     decorate_transitions_prepostset(sync_net)
@@ -99,8 +99,8 @@ def compute_alignments(trace_idx: int,
     while not len(open_set) == 0:
         curr = heapq.heappop(open_set)
 
-        if curr.f > optimal_alignment_cost + cost_tolerance:
-            return all_alignments, optimal_alignment_cost
+        if curr.f > optimal_alignment_lst[trace_idx] + cost_tolerance:
+            return all_alignments
 
         current_marking = curr.m
 
@@ -137,7 +137,9 @@ def compute_alignments(trace_idx: int,
                 if not reach_fm:
                     reach_fm = True
                     # reach the final marking for the first time, construct the optimal alignment
-                    alignment, optimal_alignment_cost = reconstruct_optimal_alignment(curr)
+                    alignment, optimal_cost = reconstruct_optimal_alignment(curr)
+                    if optimal_cost < optimal_alignment_lst[trace_idx]:
+                        optimal_alignment_lst[trace_idx] = optimal_cost
                 else:
                     alignment = reconstruct_alignment(curr)
                 all_alignments.append(alignment)
@@ -314,9 +316,12 @@ def get_cost_map(petri_net):
     return model_cost_function, sync_cost_function
 
 
-def sub_process(cost_tolerance,
+def sub_process(optimal_alignment_lst,
+                cost_tolerance,
                 event_log,
-                petri_net):
+                petri_net,
+                return_dict,
+                process_id):
     '''
 
     Parameters
@@ -334,19 +339,18 @@ def sub_process(cost_tolerance,
     petri_fm = final_marking.discover_final_marking(petri_net)
     petri_im = initial_marking.discover_initial_marking(petri_net)
     trace2alignments_lst = []
-    trace2_cost_lst = []
 
     # iterate every case in the log
     for case_index in range(len(event_log)):
-        alignments_cost_dicts, optimal_alignment_cost = compute_alignments(case_index,
-                                                                           cost_tolerance,
-                                                                           event_log[case_index],
-                                                                           petri_net,
-                                                                           petri_im,
-                                                                           petri_fm)
+        alignments_cost_dicts = compute_alignments(case_index,
+                                                   optimal_alignment_lst,
+                                                   cost_tolerance,
+                                                   event_log[case_index],
+                                                   petri_net,
+                                                   petri_im,
+                                                   petri_fm)
         trace2alignments_lst.append(alignments_cost_dicts)
-        trace2_cost_lst.append(optimal_alignment_cost)
-    return trace2alignments_lst, trace2_cost_lst
+    return_dict[process_id] = trace2alignments_lst
 
 
 if __name__ == '__main__':
@@ -355,30 +359,56 @@ if __name__ == '__main__':
     event_log = xes_importer.apply(log_path)
 
     # import the petri net
-    net, im, fm = pnml_importer.apply("../model/prAm6.pnml")
+    net, im, fm = pnml_importer.apply("../model/prAm6_fodina.pnml")
     print("original net transition: ", len(net.transitions), " places: ", len(net.places))
 
     time_result = []
 
     for cost_tolerance in PARAM_COST_TOLERANCE:
         temp_time_result = []
-        manager = multiprocessing.Manager()
-        start_time = time.time()
-        trace2alignments_lst, trace2_cost_lst = sub_process(cost_tolerance,
-                                                            event_log,
-                                                            net)
-        print("t2a: ", trace2_cost_lst)
-        all_alignment_result = {key: [] for key in range(len(event_log))}
-        # for each net, get the list of alignments list
-        for alignments_lst_idx in range(len(trace2alignments_lst)):
-            for each_alignment in trace2alignments_lst[alignments_lst_idx]:
-                for k, v in list(each_alignment.items()):
-                    if v > trace2_cost_lst[alignments_lst_idx] + cost_tolerance:
-                        continue
-                    all_alignment_result[alignments_lst_idx].append(each_alignment)
-        print("time it takes: ", time.time() - start_time)
-        temp_time_result.append(time.time() - start_time)
+
+        for cpu_num in PARAM_CPU_NUM_LST:
+            start_time = time.time()
+            manager = multiprocessing.Manager()
+            return_dict = manager.dict()
+
+            overlap_threshold = 0.5
+            net_lst = decompose_into_k_subnet(net, cpu_num, overlap_threshold)
+            optimal_alignment_lst = manager.list([1000000 for i in range(len(event_log))])
+
+            processes = []
+            if cpu_num > len(net_lst):
+                print("net num smaller than cpu num")
+                break
+
+            process_id = 0
+
+            args = [[optimal_alignment_lst,
+                     cost_tolerance,
+                     event_log,
+                     net_lst[each_net_idx],
+                     return_dict,
+                     process_id] for each_net_idx in range(len(net_lst))]
+
+            with WorkerPool(n_jobs=cpu_num) as pool:
+                pool.map(sub_process, args)
+                # Create and start a process for each task
+
+            all_alignment_result = {key: [] for key in range(len(event_log))}
+
+            # for each net, get the list of alignments list
+            for net_id, alignments_lst_lst in return_dict.items():
+                for alignments_lst_idx in range(len(alignments_lst_lst)):
+                    for each_alignment in alignments_lst_lst[alignments_lst_idx]:
+                        for k, v in list(each_alignment.items()):
+                            if v > optimal_alignment_lst[alignments_lst_idx] + cost_tolerance:
+                                continue
+                            all_alignment_result[alignments_lst_idx].append(each_alignment)
+            print("net num: ", len(net_lst), "cpu_num: ", cpu_num, "cost tolerance: ", cost_tolerance,
+                  " optimal alignment lst: ", list(optimal_alignment_lst))
+            print("time it takes: ", time.time() - start_time)
+            temp_time_result.append(time.time() - start_time)
         time_result.append(temp_time_result)
 
     result = pd.DataFrame(time_result)
-    result.to_excel('../results/PrAm6_result_single_process.xlsx')
+    result.to_excel('../results/PrAm6_result_fodina.xlsx')

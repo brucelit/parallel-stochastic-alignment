@@ -25,6 +25,7 @@ from typing import Optional, Dict, Any, Union
 from pm4py.objects.log.obj import Trace
 from pm4py.objects.petri_net.obj import PetriNet, Marking
 from pm4py.util import typing
+from ray._private.services import get_node_ip_address
 from tqdm import tqdm
 from pm4py.objects.log.importer.xes import importer as xes_importer
 from pm4py.objects.petri_net.importer import importer as pnml_importer
@@ -34,7 +35,6 @@ from src.decompose_petri import decompose_into_k_subnet
 
 # Set the logging level to WARNING to suppress informational messages
 logging.getLogger('pm4py').setLevel(logging.WARNING)
-logging.getLogger('ray').setLevel(logging.ERROR)
 
 class Parameters(Enum):
     PARAM_TRACE_COST_FUNCTION = 'trace_cost_function'
@@ -56,7 +56,7 @@ PARAM_TRACE_COST_FUNCTION = Parameters.PARAM_TRACE_COST_FUNCTION.value
 PARAM_MODEL_COST_FUNCTION = Parameters.PARAM_MODEL_COST_FUNCTION.value
 PARAM_SYNC_COST_FUNCTION = Parameters.PARAM_SYNC_COST_FUNCTION.value
 PARAM_COST_TOLERANCE = 2
-PARAM_CPU_NUM = [3,4,5,6,7,8]
+PARAM_CPU_NUM = [4,5,6,7,8]
 
 SKIP = '>>'
 STD_MODEL_LOG_MOVE_COST = 1
@@ -185,22 +185,23 @@ class SearchTuple:
         return " ".join(string_build)
 
 
+def initiate_alignment_cost(log_len):
+    return [1000000000 for i in range(log_len)]
+
+
 @ray.remote
 class Coordinator:
     def __init__(self, log_len):
         self.alignments = self.initiate_alignment_dict(log_len)
-        self.target_num = self.initiate_alignment_cost(log_len)
+        self.target_num = initiate_alignment_cost(log_len)
         self.worker_handles = []
 
     def get_target_num(self):
         return self.target_num
 
-    def initiate_alignment_cost(self, log_len):
-        return [1000000000 for i in range(log_len)]
-
     def initiate_alignment_dict(self, log_len):
         main_dict = {}
-        # Populate the dictionary with keys ranging from 0 to 200
+        # Populate the dictionary with keys ranging from 0 to log length
         for i in range(log_len):
             main_dict[i] = {}
         # Print the dictionary to verify
@@ -209,20 +210,19 @@ class Coordinator:
     def register_worker(self, worker_handle):
         self.worker_handles.append(worker_handle)
 
-    def update_cost(self, optimal_cost, trace_idx):
-        self.target_num[trace_idx] = optimal_cost
-        # update the alignment list
-        for k, v in list(self.alignments[trace_idx].items()):
-            if v > optimal_cost + PARAM_COST_TOLERANCE:
-                del self.alignments[trace_idx][k]
+    # def update_cost(self, optimal_cost, trace_idx):
+    #     self.target_num[trace_idx] = optimal_cost
+    #     # update the alignment list
+    #     for k, v in list(self.alignments[trace_idx].items()):
+    #         if v > optimal_cost + PARAM_COST_TOLERANCE:
+    #             del self.alignments[trace_idx][k]
 
 
-    def update_result(self, optimal_cost, trace_idx, net_idx):
+    def update_cost(self, optimal_cost, trace_idx, net_idx):
         if optimal_cost < self.target_num[trace_idx]:
-            print("update optimal cost: ", optimal_cost, " trace id: ", trace_idx, "net id: ", net_idx)
+            print("update optimal cost: ", optimal_cost, " trace id: ", trace_idx," net idx: ", net_idx)
             self.target_num[trace_idx] = optimal_cost
-            # print("after update", target_num)
-            self.broadcast_optimal_cost(optimal_cost, trace_idx)
+            self.broadcast_optimal_cost(trace_idx)
 
 
     def update_alignment(self, alignments_to_add, trace_idx):
@@ -234,20 +234,22 @@ class Coordinator:
     def get_all_alignment(self):
         return self.alignments
 
-    def broadcast_optimal_cost(self, optimal_cost, trace_idx):
-        print("broadcast the optimal cost result")
+    def broadcast_optimal_cost(self, trace_idx):
+        print("broadcast the optimal cost result for: ", trace_idx)
         for worker in self.worker_handles:
-            worker.receive_update.remote(optimal_cost, trace_idx)
+            value = ray.get(worker.target_num.remote())
 
 @ray.remote
 class Worker:
     def __init__(self, coordinator):
         self.coordinator = coordinator
         self.log = None
+        self.optimal_alignment_lst = initiate_alignment_cost(log_len)
 
 
-    def receive_update(self, optimal_cost, trace_idx):
-        self.optimal_alignment_lst[trace_idx] = optimal_cost
+    def receive_update(self, trace_idx):
+        print("receive optimal cost")
+        self.optimal_alignment_lst[trace_idx] = ray.get(self.coordinator.target_num[trace_idx])
 
 
     def apply(self,
@@ -481,9 +483,8 @@ class Worker:
 
         while not len(open_set) == 0:
             curr = heapq.heappop(open_set)
-            target = ray.get(self.coordinator.get_target_num.remote())
 
-            if curr.f > target[trace_idx] + PARAM_COST_TOLERANCE:
+            if curr.f > self.optimal_alignment_lst[trace_idx] + PARAM_COST_TOLERANCE:
                 return all_alignments
 
             current_marking = curr.m
@@ -521,10 +522,10 @@ class Worker:
             if curr.h < 0.01:
                 if current_marking == fin:
                     alignment, cost = reconstruct_alignment(curr)
-                    if cost < ray.get(self.coordinator.get_target_num.remote())[trace_idx]:
-                        self.coordinator.update_cost.remote(cost, trace_idx)
+                    if cost < self.optimal_alignment_lst[trace_idx]:
+                        self.coordinator.update_cost.remote(cost, trace_idx,net_idx)
                     all_alignments = merge_dict(all_alignments, alignment)
-                    self.coordinator.update_alignment.remote(alignment, trace_idx)
+
                     continue
 
             closed.add(current_marking)
@@ -571,16 +572,18 @@ class Worker:
 
 for cpu_num in PARAM_CPU_NUM:
     start_time = time.time()
-    net, im, fm = pnml_importer.apply("../model/prBm6.pnml")
-    print("original net: ", " with transition: ", len(net.transitions), " with places: ", len(net.places))
+    net, im, fm = pnml_importer.apply("../model/prAm6.pnml")
 
     net_lst = decompose_into_k_subnet(net,cpu_num)
 
     # Initialize Ray
     ray.init(num_cpus=cpu_num)
+    # Get the local node IP address
+    node_ip = get_node_ip_address()
 
+    print(f"The local node IP address is: {node_ip}")
     # get the petri list
-    log_path = "../log/prBm6_variants.xes"
+    log_path = "../log/prAm6_variants_1.xes"
     event_log = xes_importer.apply(log_path)
     log_len = len(event_log)
     coordinator = Coordinator.remote(log_len)

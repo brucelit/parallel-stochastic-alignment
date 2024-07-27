@@ -26,6 +26,7 @@ from src.search_sync_net import copy_into, is_log_move, is_model_move
 # Set the logging level to WARNING to suppress informational messages
 logging.getLogger('pm4py').setLevel(logging.WARNING)
 
+PARAM_CPU_NUM_LST = [3, 4, 5, 6, 7, 8]
 PARAM_COST_TOLERANCE = [2000]
 SKIP = '>>'
 STD_MODEL_LOG_MOVE_COST = 1000
@@ -34,6 +35,7 @@ STD_SYNC_COST = 0
 
 
 def compute_alignments(trace_idx: int,
+                       optimal_alignment_lst,
                        cost_tolerance: int,
                        trace: Trace,
                        petri_net: PetriNet,
@@ -56,9 +58,6 @@ def compute_alignments(trace_idx: int,
 
     # determine whether the final marking is reached for the first time
     reach_fm = False
-
-    # get the optimal cost
-    optimal_alignment_cost = 1000000
 
     # ---- initialize ------
     decorate_transitions_prepostset(sync_net)
@@ -99,8 +98,8 @@ def compute_alignments(trace_idx: int,
     while not len(open_set) == 0:
         curr = heapq.heappop(open_set)
 
-        if curr.f > optimal_alignment_cost + cost_tolerance:
-            return all_alignments, optimal_alignment_cost
+        if curr.f > optimal_alignment_lst[trace_idx] + cost_tolerance:
+            return all_alignments
 
         current_marking = curr.m
 
@@ -137,7 +136,9 @@ def compute_alignments(trace_idx: int,
                 if not reach_fm:
                     reach_fm = True
                     # reach the final marking for the first time, construct the optimal alignment
-                    alignment, optimal_alignment_cost = reconstruct_optimal_alignment(curr)
+                    alignment, optimal_cost = reconstruct_optimal_alignment(curr)
+                    if optimal_cost < optimal_alignment_lst[trace_idx]:
+                        optimal_alignment_lst[trace_idx] = optimal_cost
                 else:
                     alignment = reconstruct_alignment(curr)
                 all_alignments.append(alignment)
@@ -314,9 +315,12 @@ def get_cost_map(petri_net):
     return model_cost_function, sync_cost_function
 
 
-def sub_process(cost_tolerance,
+def sub_process(optimal_alignment_lst,
+                cost_tolerance,
                 event_log,
-                petri_net):
+                petri_net,
+                return_dict,
+                process_id):
     '''
 
     Parameters
@@ -334,51 +338,208 @@ def sub_process(cost_tolerance,
     petri_fm = final_marking.discover_final_marking(petri_net)
     petri_im = initial_marking.discover_initial_marking(petri_net)
     trace2alignments_lst = []
-    trace2_cost_lst = []
 
     # iterate every case in the log
     for case_index in range(len(event_log)):
-        alignments_cost_dicts, optimal_alignment_cost = compute_alignments(case_index,
-                                                                           cost_tolerance,
-                                                                           event_log[case_index],
-                                                                           petri_net,
-                                                                           petri_im,
-                                                                           petri_fm)
-        trace2alignments_lst.append(alignments_cost_dicts)
-        trace2_cost_lst.append(optimal_alignment_cost)
-    return trace2alignments_lst, trace2_cost_lst
+        # set the cost of model and log move
+        model_cost_function, sync_cost_function = get_cost_map(petri_net)
+
+        # get trace net
+        trace_net, trace_im, trace_fm = construct_trace_net_cost_aware(event_log[case_index])
+
+        # construct the synchronous product net with cost
+        sync_net, sync_im, sync_fm, cost_function = construct_cost_aware(trace_net,
+                                                                         trace_im,
+                                                                         trace_fm,
+                                                                         petri_net,
+                                                                         petri_im,
+                                                                         petri_fm,
+                                                                         model_cost_function)
+
+        # determine whether the final marking is reached for the first time
+        reach_fm = False
+
+        # ---- initialize ------
+        decorate_transitions_prepostset(sync_net)
+        decorate_places_preset_trans(sync_net)
+        incidence_matrix = inc_mat_construct(sync_net)
+        trans_empty_preset = set(t for t in sync_net.transitions if len(t.in_arcs) == 0)
+
+        fin_vec = incidence_matrix.encode_marking(sync_fm)
+        cost_vec = [0] * len(cost_function)
+        for t in cost_function.keys():
+            cost_vec[incidence_matrix.transitions[t]] = 1.0 * cost_function[t]
+        cost_vec = matrix(cost_vec)
+
+        a_matrix = matrix(np.asmatrix(incidence_matrix.a_matrix).astype(np.float64))
+        h_cvx = matrix(np.matrix(np.zeros(len(sync_net.transitions))).transpose())
+        g_matrix = matrix(-np.eye(len(sync_net.transitions)))
+
+        h, x = compute_exact_heuristic_new_version(sync_net,
+                                                   a_matrix,
+                                                   h_cvx,
+                                                   g_matrix,
+                                                   cost_vec,
+                                                   incidence_matrix,
+                                                   sync_im,
+                                                   fin_vec,
+                                                   lp_solver.DEFAULT_LP_SOLVER_VARIANT)
+        ini_search_marking = SearchMarking(0 + h, 0, h, sync_im, None, None, x, True)
+        open_set = [ini_search_marking]
+        heapq.heapify(open_set)
+        # visited = 0
+        # queued = 0
+        # traversed = 0
+        # lp_solved = 1
+        closed = set()
+        all_alignments = []
+        # ---- initialize ------
+
+        while not len(open_set) == 0:
+            curr = heapq.heappop(open_set)
+
+            if curr.f > optimal_alignment_lst[case_index] + cost_tolerance:
+                trace2alignments_lst.append(all_alignments)
+                break
+
+            current_marking = curr.m
+
+            while not curr.trust:
+                already_closed = current_marking in closed
+
+                if already_closed:
+                    if len(open_set) == 0:
+                        trace2alignments_lst.append(all_alignments)
+                        break
+
+                    curr = heapq.heappop(open_set)
+                    current_marking = curr.m
+                    continue
+
+                h, x = compute_exact_heuristic_new_version(sync_net, a_matrix, h_cvx, g_matrix, cost_vec,
+                                                           incidence_matrix,
+                                                           curr.m, fin_vec, lp_solver.DEFAULT_LP_SOLVER_VARIANT)
+                # lp_solved += 1
+                tp = SearchMarking(curr.g + h, curr.g, h, curr.m, curr.p, curr.t, x, True)
+                curr = heapq.heappushpop(open_set, tp)
+                current_marking = curr.m
+
+            # max allowed heuristics value (27/10/2019, due to the numerical instability of pm4py solvers)
+            if curr.h > lp_solver.MAX_ALLOWED_HEURISTICS:
+                continue
+
+            # 12/10/2019: do it again, since the marking could be changed
+            already_closed = current_marking in closed
+            if already_closed:
+                continue
+
+            # 12/10/2019: the current marking can be equal to the final marking only if the heuristics
+            # (underestimation of the remaining cost) is 0. Low-hanging fruits
+            if curr.h < 0.01:
+                if current_marking == sync_fm:
+                    if not reach_fm:
+                        reach_fm = True
+                        # reach the final marking for the first time, construct the optimal alignment
+                        alignment, optimal_cost = reconstruct_optimal_alignment(curr)
+                        if optimal_cost < optimal_alignment_lst[case_index]:
+                            optimal_alignment_lst[case_index] = optimal_cost
+                            print("case index: ", case_index, " for net: ", len(petri_net.transitions),  "alignment: ", alignment)
+                    else:
+                        alignment = reconstruct_alignment(curr)
+                    all_alignments.append(alignment)
+                    continue
+
+            closed.add(current_marking)
+            # visited += 1
+            enabled_trans = copy(trans_empty_preset)
+            for p in current_marking:
+                for t in p.ass_trans:
+                    if t.sub_marking <= current_marking:
+                        enabled_trans.add(t)
+
+            trans_to_visit_with_cost = [(t, cost_function[t]) for t in enabled_trans if not (
+                    t is not None and is_log_move(t) and is_model_move(t))]
+
+            for t, cost in trans_to_visit_with_cost:
+                # traversed += 1
+                new_marking = add_markings(current_marking, t.add_marking)
+
+                # no longer use if the marking is in closed set
+                if new_marking in closed:
+                    continue
+                g = curr.g + cost
+                # queued += 1
+                h, x = derive_heuristic(incidence_matrix, cost_vec, curr.x, t, curr.h)
+                trustable = trust_solution(x)
+                new_f = g + h
+                tp = SearchMarking(new_f, g, h, new_marking, curr, t, x, trustable)
+                heapq.heappush(open_set, tp)
+    return_dict[process_id] = trace2alignments_lst
 
 
 if __name__ == '__main__':
     # import the event log
-    log_path = "../log/prAm6_variants.xes"
+    log_path = "../log/prAm6_variants_100.xes"
     event_log = xes_importer.apply(log_path)
 
     # import the petri net
-    net, im, fm = pnml_importer.apply("../model/prAm6.pnml")
+    net, im, fm = pnml_importer.apply("../model/prAm6_fodina.pnml")
     print("original net transition: ", len(net.transitions), " places: ", len(net.places))
 
     time_result = []
 
     for cost_tolerance in PARAM_COST_TOLERANCE:
         temp_time_result = []
-        manager = multiprocessing.Manager()
-        start_time = time.time()
-        trace2alignments_lst, trace2_cost_lst = sub_process(cost_tolerance,
-                                                            event_log,
-                                                            net)
-        print("t2a: ", trace2_cost_lst)
-        all_alignment_result = {key: [] for key in range(len(event_log))}
-        # for each net, get the list of alignments list
-        for alignments_lst_idx in range(len(trace2alignments_lst)):
-            for each_alignment in trace2alignments_lst[alignments_lst_idx]:
-                for k, v in list(each_alignment.items()):
-                    if v > trace2_cost_lst[alignments_lst_idx] + cost_tolerance:
-                        continue
-                    all_alignment_result[alignments_lst_idx].append(each_alignment)
-        print("time it takes: ", time.time() - start_time)
-        temp_time_result.append(time.time() - start_time)
+
+        for cpu_num in PARAM_CPU_NUM_LST:
+            manager = multiprocessing.Manager()
+            return_dict = manager.dict()
+            start_time = time.time()
+
+            overlap_threshold = 0.5
+            net_lst = decompose_into_k_subnet(net, cpu_num, overlap_threshold)
+            optimal_alignment_lst = mp.Array('i', [1000000 for i in range(len(event_log))])
+
+            processes = []
+            if cpu_num > len(net_lst):
+                print("trace num smaller than cpu num")
+                break
+
+            process_id = 0
+            for each_net in net_lst:
+                print("each net transition: ", len(each_net.transitions), " places: ", len(each_net.places))
+
+                # Create and start a process for each task
+                p = multiprocessing.Process(target=sub_process,
+                                            args=(optimal_alignment_lst,
+                                                  cost_tolerance,
+                                                  event_log,
+                                                  each_net,
+                                                  return_dict,
+                                                  process_id))
+                processes.append(p)
+                p.start()
+                process_id += 1
+
+            # Wait for all processes to complete
+            for p in processes:
+                p.join()
+
+            all_alignment_result = {key: [] for key in range(len(event_log))}
+
+            # for each net, get the list of alignments list
+            for net_id, alignments_lst_lst in return_dict.items():
+                for alignments_lst_idx in range(len(alignments_lst_lst)):
+                    for each_alignment in alignments_lst_lst[alignments_lst_idx]:
+                        for k, v in list(each_alignment.items()):
+                            if v > optimal_alignment_lst[alignments_lst_idx] + cost_tolerance:
+                                continue
+                            all_alignment_result[alignments_lst_idx].append(each_alignment)
+            print("net num: ", len(net_lst), "cpu_num: ", cpu_num, "cost tolerance: ", cost_tolerance,
+                  " optimal alignment lst: ", list(optimal_alignment_lst))
+            print("time it takes: ", time.time() - start_time)
+            temp_time_result.append(time.time() - start_time)
         time_result.append(temp_time_result)
 
-    result = pd.DataFrame(time_result)
-    result.to_excel('../results/PrAm6_result_single_process.xlsx')
+    # result = pd.DataFrame(time_result)
+    # result.to_excel('../results/PrAm6_result_multiprocess_model_fodina.xlsx')

@@ -8,6 +8,11 @@ __pycache__/
 
 # idea files
 .idea/
+log/
+model/
+results/
+test/
+unused/
 
 # Distribution / packaging
 .Python

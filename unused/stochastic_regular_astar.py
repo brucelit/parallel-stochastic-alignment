@@ -18,7 +18,7 @@ import pandas as pd
 from pm4py.objects.petri_net.utils import align_utils as utils
 from tqdm import tqdm
 
-from src.path_probability import get_path_prob
+from src.search_probability import get_path_prob
 from src.petri_importer import import_net
 from pm4py.objects.log.importer.xes import importer as xes_importer
 

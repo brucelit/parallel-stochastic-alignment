@@ -1,9 +1,7 @@
 import time
 
 from pm4py.objects.petri_net import properties
-from pm4py.objects.petri_net.obj import PetriNet, Marking
-from pm4py.objects.petri_net.utils import petri_utils
-from pm4py.objects.petri_net.importer import importer as pnml_importer
+from pm4py.objects.petri_net.obj import PetriNet
 from pm4py.objects.petri_net.exporter import exporter as pnml_exporter
 from pm4py.objects.petri_net.utils.petri_utils import add_arc_from_to
 from pm4py.objects.petri_net.importer import importer as pnml_importer
@@ -229,11 +227,12 @@ def merge_forward_bfs(node, merge_place_before, forward_visited_set, iter, depth
     return flag
 
 def extract_subnet_along_outgoing_edges(original_net, start_place, target_place):
-    #   get the number of transitions in the net
+
+    #  get the number of transitions in the net
     total_trans_num = len(original_net.transitions)
 
-    # get all reachable transition from start choice place to merge place
-    all_reachable_transition, all_reachable_place = __find_all_reachable_transitions_dfs(start_place, target_place)
+    # get all reachable transition from the start choice place to merge place
+    all_reachable_transition, all_reachable_place = find_all_reachable_transitions_dfs(start_place, target_place)
 
     min_overlap = 1
     transition2remove4net1 = set()
@@ -355,19 +354,21 @@ def __copy_into(source_net, target_net):
     return target_net
 
 
-def __find_all_reachable_transitions_dfs(start_place, target_place):
+def find_all_reachable_transitions_dfs(start_place, target_place):
     visited = set()
     transitions_in_path = set()
     places_in_path = set()
 
     def bfs(node):
+        # if it is the target place, then we continue
+        if node == target_place:
+            return
+
         if node in visited:
             return
         # add the node to the visited set
         visited.add(node)
-        # if it is the target place, then we continue
-        if node == target_place:
-            return
+
         if isinstance(node, PetriNet.Transition):
             transitions_in_path.add(node.name)
         if isinstance(node, PetriNet.Place):
@@ -387,13 +388,15 @@ def find_transitions_dfs(start_node, target_place):
     places_in_path = set()
 
     def bfs(node):
+        # if it is the target place, then we continue
+        if node == target_place:
+            return
+
         if node in visited:
             return
         # add the node to the visited set
         visited.add(node)
-        # if it is the target place, then we continue
-        if node == target_place:
-            return
+
         if isinstance(node, PetriNet.Transition):
             transitions_in_path.add(node.name)
         if isinstance(node, PetriNet.Place):
@@ -443,7 +446,7 @@ def get_reduced_pair(net):
     return reduced_valid_pair
 
 
-def decompose_into_k_subnet(petri_net, target_num):
+def decompose_into_k_subnet(petri_net, target_num, overlap_threshold):
     sub_net_lst = [petri_net]
 
     while len(sub_net_lst) < target_num:
@@ -457,6 +460,15 @@ def decompose_into_k_subnet(petri_net, target_num):
             if temp_min_overlap < min_overlap1:
                 min_overlap1 = temp_min_overlap
                 net1, net2 = temp_net1, temp_net2
+                valid_source = k
+                valid_target = v
+
+        if min_overlap1 > overlap_threshold:
+            sub_net_lst.append(target_net)
+            break
+        print("min overlap: ", min_overlap1, "valid k,v:", valid_source, valid_target)
+        for out_arc in valid_source.out_arcs:
+            print("target: ", out_arc.target)
         sub_net_lst.append(net1)
         sub_net_lst.append(net2)
 
@@ -478,7 +490,7 @@ if __name__ == "__main__":
     print("transition number: ", len(net.transitions), " place number: ", len(net.places),"\n")
 
     start_time = time.time()
-    net_lst = decompose_into_k_subnet(net,4)
+    net_lst = decompose_into_k_subnet(net,4, 0.8)
 
     idx = 1
     for each_net in net_lst:

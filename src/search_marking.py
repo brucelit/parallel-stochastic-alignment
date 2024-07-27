@@ -1,4 +1,4 @@
-class SearchTuple:
+class SearchMarking:
     def __init__(self, f, g, h, m, p, t, x, trust):
         self.f = f
         self.g = g
